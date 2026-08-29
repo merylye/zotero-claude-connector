@@ -1,0 +1,79 @@
+{
+  "manifest_version": "0.2",
+  "name": "zotero-connector",
+  "display_name": "Zotero Connector",
+  "version": "1.1.0",
+  "description": "Read papers, notes, and citations from your Zotero library; optionally let Claude help organize it, including moving items to the trash (all reversible).",
+  "long_description": "Connects Claude to the Zotero app running on this computer. Claude can browse your collections (including group libraries), read the full text of papers, search inside PDFs, retrieve your notes and highlights, and export BibTeX or formatted bibliographies in any citation style. With a Zotero API key it can also help organize your library: creating collections, filing papers, managing tags, moving items to Zotero's trash, and deleting collections. Item records themselves are never edited, and nothing is ever erased permanently. Trashed items sit in Zotero's Trash and are recoverable there for 30 days; deleting a collection leaves its papers in the library. Every change is journaled and any change can be undone. Requires the Zotero desktop app with its local API enabled (Settings → Advanced → 'Allow other applications on this computer to communicate with Zotero').",
+  "author": {
+    "name": "zotero-claude-connector contributors"
+  },
+  "icon": "icon.png",
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/server/index.js"
+      ],
+      "env": {
+        "ZOTERO_API_KEY": "${user_config.zotero_api_key}",
+        "ENABLE_WRITES": "${user_config.enable_writes}",
+        "ENABLE_DELETES": "${user_config.enable_deletes}",
+        "ZOTERO_LOCAL_TIMEOUT_MS": "${user_config.local_timeout_seconds}000"
+      }
+    }
+  },
+  "user_config": {
+    "zotero_api_key": {
+      "type": "string",
+      "title": "Zotero API key (optional — needed only for organizing)",
+      "description": "Create one at zotero.org/settings/keys/new with library read + write access. Leave blank for read-only use.",
+      "sensitive": true,
+      "required": false,
+      "default": ""
+    },
+    "enable_writes": {
+      "type": "boolean",
+      "title": "Allow Claude to organize the library (collections & tags only, reversible)",
+      "description": "If off, Claude can only read. If on, Claude can create collections, file papers, and manage tags — always asking first, with every change undoable.",
+      "required": false,
+      "default": true
+    },
+    "enable_deletes": {
+      "type": "boolean",
+      "title": "Allow Claude to delete (trash items, delete collections)",
+      "description": "Only applies when organizing is on. Items go to Zotero's trash, recoverable there for 30 days; deleting a collection leaves its papers in the library. Nothing is ever erased permanently, and every deletion is undoable.",
+      "required": false,
+      "default": true
+    },
+    "local_timeout_seconds": {
+      "type": "number",
+      "title": "Seconds to wait for Zotero before giving up",
+      "description": "If Zotero stops answering, the connector reports a clear error after this long instead of hanging. Raise it only if you routinely work with very large collections. Default 20.",
+      "required": false,
+      "default": 20,
+      "min": 2,
+      "max": 300
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  },
+  "keywords": [
+    "zotero",
+    "references",
+    "citations",
+    "research",
+    "bibliography"
+  ],
+  "license": "MIT"
+}
