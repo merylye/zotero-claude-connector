@@ -23,10 +23,11 @@ export class HttpTimeout extends Error {
   }
 }
 
-function responseLike(status, headers, body) {
+function responseLike(status, headers, body, truncated = false) {
   return {
     ok: status >= 200 && status < 300,
     status,
+    truncated,
     headers: { get: (k) => headers[String(k).toLowerCase()] ?? null },
     text: async () => body,
     json: async () => (body ? JSON.parse(body) : null),
@@ -40,6 +41,7 @@ export function rawRequest(urlStr, opts = {}) {
     body = null,
     timeoutMs = 20000,
     followRedirects = true,
+    maxBytes = 0,
     _depth = 0,
   } = opts;
 
@@ -104,11 +106,23 @@ export function rawRequest(urlStr, opts = {}) {
           }
         }
         const chunks = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () =>
-          finish(resolve, responseLike(res.statusCode, res.headers, Buffer.concat(chunks).toString("utf8")))
-        );
-        res.on("error", fail);
+        let size = 0;
+        let truncated = false;
+        const done = () =>
+          finish(resolve, responseLike(res.statusCode, res.headers, Buffer.concat(chunks).toString("utf8"), truncated));
+        res.on("data", (c) => {
+          chunks.push(c);
+          size += c.length;
+          // A page of unknown size only has to yield its <head>. Stop rather than buffer a
+          // hundred megabytes because someone pointed the tool at the wrong URL.
+          if (maxBytes && size >= maxBytes) {
+            truncated = true;
+            res.destroy();
+            done();
+          }
+        });
+        res.on("end", done);
+        res.on("error", (e) => (truncated ? done() : fail(e)));
       }
     );
 

@@ -20,6 +20,10 @@ const transport = new StdioClientTransport({
     ZOTERO_API_KEY: "testkey123",
     ZOTERO_CONNECTOR_DATA_DIR: dataDir,
     ENABLE_WRITES: "true",
+    DOI_RESOLVER_BASE: "http://127.0.0.1:8123/doi",
+    ARXIV_API_BASE: "http://127.0.0.1:8123/arxiv",
+    OPENLIBRARY_BASE: "http://127.0.0.1:8123",
+    GOOGLE_BOOKS_BASE: "http://127.0.0.1:8123",
   },
 });
 const client = new Client({ name: "test", version: "0.0.1" });
@@ -40,7 +44,7 @@ async function call(name, args = {}) {
 // tool listing
 const tools = (await client.listTools()).tools.map((t) => t.name).sort();
 console.log("tools:", tools.join(", "));
-check("all 16 tools registered", tools.length === 16, tools.join(", "));
+check("all 17 tools registered", tools.length === 17, tools.join(", "));
 check("delete tools registered", tools.includes("delete_items") && tools.includes("delete_collection"));
 
 // check_status
@@ -194,6 +198,88 @@ const rebuiltParent = Object.values(state.collections).find((c) => c.data.name =
 check("undo rebuilds both collections", !!rebuiltSub && !!rebuiltParent, r.text);
 check("undo restores nesting", rebuiltSub?.data.parentCollection === rebuiltParent?.key, JSON.stringify(rebuiltSub?.data));
 check("undo refiles the paper", state.items.ITEM0001.data.collections.includes(rebuiltSub?.key));
+
+// ---- creating items from identifiers ----
+
+// Dry run resolves metadata and creates nothing.
+r = await call("add_items_by_identifier", { identifiers: ["10.1145/3411764.3445374"], dry_run: true });
+check("dry run resolves a DOI", r.text.includes("Designing for Reflection") && r.text.includes('"dry_run": true'), r.text.slice(0, 600));
+check("dry run maps the item type", r.text.includes("conferencePaper"), r.text.slice(0, 600));
+check("dry run creates nothing", !Object.values(state.items).some((i) => i.data.title === "Designing for Reflection in Collaborative Systems"));
+
+// The real thing.
+r = await call("add_items_by_identifier", { identifiers: ["doi:10.1145/3411764.3445374"], collection: "Metaphor Study" });
+const doiItem = Object.values(state.items).find((i) => i.data.title === "Designing for Reflection in Collaborative Systems");
+check("DOI item created", !!doiItem, r.text.slice(0, 600));
+check("conference fields mapped", doiItem?.data.proceedingsTitle?.startsWith("Proceedings of the 2021 CHI"), JSON.stringify(doiItem?.data));
+check("creators mapped", doiItem?.data.creators?.[0]?.lastName === "Okafor" && doiItem?.data.creators?.[0]?.creatorType === "author", JSON.stringify(doiItem?.data.creators));
+check("date mapped", doiItem?.data.date === "2021-05-06", doiItem?.data.date);
+check("conference name from the event field", doiItem?.data.conferenceName?.startsWith("CHI '21"), JSON.stringify(doiItem?.data.conferenceName));
+check("place from Crossref publisher-location", doiItem?.data.place === "New York, NY, USA", JSON.stringify(doiItem?.data.place));
+check("pages and DOI mapped", doiItem?.data.pages === "1-14" && doiItem?.data.DOI === "10.1145/3411764.3445374", JSON.stringify(doiItem?.data));
+check("filed into the collection", doiItem?.data.collections?.includes("AAAA1111"), JSON.stringify(doiItem?.data.collections));
+
+// Duplicate detection on a second attempt.
+r = await call("add_items_by_identifier", { identifiers: ["10.1145/3411764.3445374"] });
+check("duplicate skipped by DOI", r.text.includes("already in the library") && r.text.includes("matched on DOI"), r.text.slice(0, 500));
+r = await call("add_items_by_identifier", { identifiers: ["10.1145/3411764.3445374"], allow_duplicates: true });
+check("allow_duplicates overrides", r.text.includes('"created"') && !r.text.includes("already in the library"), r.text.slice(0, 400));
+
+// arXiv, with and without a published DOI.
+r = await call("add_items_by_identifier", { identifiers: ["arXiv:2303.08774"], tags: ["from-arxiv"] });
+const arx = Object.values(state.items).find((i) => i.data.title === "Transformers For Everything");
+check("arXiv item created as a preprint", arx?.data.itemType === "preprint", JSON.stringify(arx?.data.itemType));
+check("arXiv authors parsed", arx?.data.creators?.length === 2, JSON.stringify(arx?.data.creators));
+check("tags applied", arx?.data.tags?.some((t) => t.tag === "from-arxiv"), JSON.stringify(arx?.data.tags));
+r = await call("add_items_by_identifier", { identifiers: ["2401.00001"] });
+const pub = Object.values(state.items).find((i) => i.data.title === "A Published Version Of The Preprint");
+check("arXiv defers to its published DOI", !!pub && pub.data.itemType === "journalArticle", r.text.slice(0, 500));
+check("journal fields from the DOI record", pub?.data.publicationTitle?.startsWith("Science & Society") && pub?.data.volume === "7", JSON.stringify(pub?.data));
+check("HTML entities decoded, not passed through", !!pub && !/&amp;|&#\d+;/.test(pub.data.publicationTitle) && pub.data.publicationTitle.includes("\u2014"), JSON.stringify(pub?.data.publicationTitle));
+check("legacy dx.doi.org url normalised", pub?.data.url === "https://doi.org/10.9999/preprint.2024", JSON.stringify(pub?.data.url));
+
+// ISBN.
+r = await call("add_items_by_identifier", { identifiers: ["978-0-226-46801-3"] });
+const bk = Object.values(state.items).find((i) => i.data.title === "Metaphors We Live By");
+check("ISBN book created", bk?.data.itemType === "book", r.text.slice(0, 500));
+check("book publisher and pages", bk?.data.publisher === "University of Chicago Press" && bk?.data.numPages === "242", JSON.stringify(bk?.data));
+
+// Crossref's own type vocabulary, which is what a live DOI actually returns.
+r = await call("add_items_by_identifier", { identifiers: ["10.1101/2020.03.20.000133"] });
+const pre = Object.values(state.items).find((i) => i.data.title === "Deep Learning For Bioimaging Without The Barriers");
+check("posted-content becomes a preprint", pre?.data.itemType === "preprint", r.text.slice(0, 400));
+check("preprint repository from institution", pre?.data.repository === "bioRxiv", JSON.stringify(pre?.data.repository));
+check("JATS markup stripped from the abstract", !!pre && !/<jats:|<\/jats:/.test(pre.data.abstractNote) && pre.data.abstractNote.includes("significant barriers"), JSON.stringify(pre?.data.abstractNote));
+check("empty container-title array ignored", !pre?.data.publicationTitle, JSON.stringify(pre?.data.publicationTitle));
+
+r = await call("add_items_by_identifier", { identifiers: ["10.1017/CBO9780511815355"] });
+const mono = Object.values(state.items).find((i) => i.data.title === "A Monograph About Method");
+check("monograph becomes a book", mono?.data.itemType === "book", r.text.slice(0, 400));
+check("first ISBN taken from the array", mono?.data.ISBN === "9780511815355", JSON.stringify(mono?.data.ISBN));
+
+// A URL with citation meta tags, and one without.
+r = await call("add_items_by_identifier", { identifiers: ["http://127.0.0.1:8123/page/with-meta"] });
+const web = Object.values(state.items).find((i) => i.data.title === "Situated Knowledge In Practice");
+check("URL with meta tags becomes a journal article", web?.data.itemType === "journalArticle", r.text.slice(0, 500));
+check("meta tag fields mapped", web?.data.publicationTitle === "Studies in Method" && web?.data.pages === "200-219", JSON.stringify(web?.data));
+check("meta tag authors parsed", web?.data.creators?.[0]?.lastName === "Haraway", JSON.stringify(web?.data.creators));
+r = await call("add_items_by_identifier", { identifiers: ["http://127.0.0.1:8123/page/bare"] });
+check("bare page falls back to a webpage item", r.text.includes("Just A Blog Post") && r.text.includes("webpage"), r.text.slice(0, 500));
+
+// Nonsense in, useful error out, and one bad identifier does not sink the batch.
+r = await call("add_items_by_identifier", { identifiers: ["not an identifier at all"] });
+check("unrecognisable identifier explains itself", r.text.includes("Could not tell what"), r.text.slice(0, 400));
+r = await call("add_items_by_identifier", { identifiers: ["10.9999/does-not-exist", "10.9999/preprint.2024"], allow_duplicates: true });
+check("batch survives one bad identifier", r.text.includes("could_not_resolve") && r.text.includes("A Published Version"), r.text.slice(0, 600));
+
+// Undo trashes what was created rather than erasing it.
+r = await call("add_items_by_identifier", { identifiers: ["10.9999/preprint.2024"], allow_duplicates: true });
+const undoTarget = r.text.match(/"change_id": "(chg_[^"]+)"/)[1];
+const madeKey = r.text.match(/\[([A-Z0-9]{8})\]/)[1];
+check("created item is live", state.items[madeKey]?.data.deleted !== 1);
+r = await call("undo_changes", { change_ids: [undoTarget] });
+check("undo trashes the created item", state.items[madeKey]?.data.deleted === 1, r.text.slice(0, 400));
+check("undo does not erase the record", !!state.items[madeKey]);
 
 // ---- the timeout fix ----
 // A Zotero that accepts connections but never answers must produce an error, not a hang.

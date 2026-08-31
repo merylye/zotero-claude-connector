@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.2.0 (2026-08-29)
+
+### Added
+- **`add_items_by_identifier`.** Creates Zotero items from DOIs, arXiv IDs, ISBNs, and URLs, mixed
+  freely in one call, optionally filed into a collection and tagged on the way in. Metadata comes
+  from `doi.org` content negotiation (CSL-JSON, whichever agency registered the DOI), the arXiv API,
+  Open Library with a Google Books fallback, and for a plain URL the page's own `citation_*`,
+  Dublin Core, and Open Graph meta tags. An arXiv preprint that reports a published DOI is resolved
+  through that DOI instead, and a page declaring a `citation_doi` is too, since the version of
+  record beats a scraped page every time.
+- `dry_run` reports what was found without writing anything, so the metadata can be checked before
+  it lands in the library. Duplicates are detected by DOI, then by normalised title, and skipped
+  with a note unless `allow_duplicates` is set.
+- Items are built against Zotero's published item templates, fetched at runtime, so only fields the
+  target item type actually has are sent, and the mapping survives Zotero adding item types.
+  Metadata with no home for its type, such as a DOI on a book, goes to `extra`.
+- Undo moves created items to the trash rather than erasing them, keeping the guarantee that nothing
+  this connector does is irreversible.
+- `maxBytes` on the HTTP transport, so fetching a page of unknown size stops after 2MB instead of
+  buffering whatever the server sends.
+
+### Validated against the live services
+The metadata sources were checked against real responses before release, which caught six mismatches
+the mock had hidden. Crossref's CSL transform emits Crossref's own type vocabulary rather than CSL's
+(`journal-article`, `proceedings-article`, `monograph`, not `article-journal`, `paper-conference`,
+`book`), so three of four test DOIs were falling back to journalArticle. Crossref also says
+`publisher-location` where CSL says `publisher-place`; carries the conference name in `event`; puts a
+preprint server's name in `institution` rather than `publisher`; returns `container-title` as an empty
+array on preprints; and returns abstracts as JATS XML that needs its tags stripped. All six are fixed,
+and the test fixtures now mirror the real payload shapes rather than idealised CSL.
+
+### Fixed after a live test
+Two more surfaced running real DOIs against a real library. Crossref returns entity-encoded text, so
+`AI &amp; SOCIETY` was landing in the publication field verbatim; every string reaching Zotero is now
+decoded, named and numeric entities alike. And the `URL` Crossref supplies uses the legacy
+`http://dx.doi.org/` form, which is now normalised to `https://doi.org/`.
+
+### Known limits
+- URL lookups have none of Zotero's site-specific translators behind them. Publishers and preprint
+  servers emit the meta tags this reads; blogs and JavaScript-rendered pages often do not, and those
+  fall back to a bare webpage item. Zotero's browser button remains better for arbitrary pages.
+- Metadata only. No PDF is downloaded or attached.
+
 ## 1.1.0 (2026-08-29)
 
 ### Fixed

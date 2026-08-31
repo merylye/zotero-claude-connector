@@ -59,6 +59,28 @@ export const state = {
   groupItems: {},
 };
 
+// Field sets mirroring what api.zotero.org/items/new returns, trimmed to what the mapper uses.
+const COMMON = { key: "", version: 0, itemType: "", title: "", creators: [], abstractNote: "", date: "",
+  language: "", url: "", accessDate: "", extra: "", tags: [], collections: [], relations: {} };
+export const TEMPLATES = {
+  journalArticle: { ...COMMON, itemType: "journalArticle", publicationTitle: "", volume: "", issue: "",
+    pages: "", series: "", seriesTitle: "", DOI: "", ISSN: "", journalAbbreviation: "" },
+  conferencePaper: { ...COMMON, itemType: "conferencePaper", proceedingsTitle: "", conferenceName: "",
+    place: "", publisher: "", volume: "", pages: "", series: "", DOI: "", ISBN: "" },
+  book: { ...COMMON, itemType: "book", publisher: "", place: "", edition: "", numPages: "", series: "",
+    seriesNumber: "", ISBN: "" },
+  preprint: { ...COMMON, itemType: "preprint", genre: "", repository: "", archiveID: "", place: "",
+    DOI: "", citationKey: "" },
+  webpage: { ...COMMON, itemType: "webpage", websiteTitle: "", websiteType: "" },
+};
+export const CREATOR_TYPES = {
+  journalArticle: ["author", "contributor", "editor", "reviewedAuthor", "translator"],
+  conferencePaper: ["author", "contributor", "editor", "seriesEditor", "translator"],
+  book: ["author", "contributor", "editor", "seriesEditor", "translator"],
+  preprint: ["author", "contributor", "editor", "translator"],
+  webpage: ["author", "contributor", "translator"],
+};
+
 function send(res, code, body, headers = {}) {
   const isStr = typeof body === "string";
   res.writeHead(code, { "Content-Type": isStr ? "text/plain" : "application/json", ...headers });
@@ -103,6 +125,11 @@ function pickItemsFromQuery(url) {
         (i.data.creators || []).some((c) => (c.lastName || "").toLowerCase().includes(needle));
       if (inMeta) return true;
       if (qmode === "everything") {
+        // Zotero's "Everything" mode searches all item fields as well as indexed full text.
+        const inAnyField = Object.entries(i.data).some(
+          ([k, v]) => typeof v === "string" && k !== "title" && v.toLowerCase().includes(needle)
+        );
+        if (inAnyField) return true;
         return childrenOf(i.key).some((att) => (state.fulltext[att.key]?.content || "").toLowerCase().includes(needle));
       }
       return false;
@@ -162,7 +189,12 @@ export function startWeb(port = 8123) {
     for await (const chunk of req) body += chunk;
     const m = (re) => p.match(re);
     let mm;
-    if (!req.headers["zotero-api-key"]) return send(res, 403, "Missing key");
+    // Item templates, creator types, and the stand-ins for external services are public,
+    // exactly as they are on the real api.zotero.org and the real metadata providers.
+    const isPublic =
+      p.startsWith("/doi/") || p === "/arxiv" || p === "/api/books" || p === "/books/v1/volumes" ||
+      p.startsWith("/page/") || p === "/items/new" || p === "/itemTypeCreatorTypes";
+    if (!isPublic && !req.headers["zotero-api-key"]) return send(res, 403, "Missing key");
     if (p === "/keys/current") return send(res, 200, { userID: 1234, username: "testuser" });
     if ((mm = m(/^\/users\/1234\/items\/(\w+)$/)) && req.method === "GET") {
       const it = state.items[mm[1]];
@@ -183,6 +215,28 @@ export function startWeb(port = 8123) {
       if (format === "bib") return send(res, 200, styledFor(items, url.searchParams.get("style") || "apa"));
       if (format === "bibtex") return send(res, 200, bibtexFor(items));
       return send(res, 200, items);
+    }
+    if (p === "/items/new") {
+      const t = TEMPLATES[url.searchParams.get("itemType")];
+      return t ? send(res, 200, t) : send(res, 400, "Invalid item type");
+    }
+    if (p === "/itemTypeCreatorTypes") {
+      const c = CREATOR_TYPES[url.searchParams.get("itemType")] || [];
+      return send(res, 200, c.map((creatorType) => ({ creatorType, localized: creatorType })));
+    }
+    if (p === "/users/1234/items" && req.method === "POST") {
+      const payload = JSON.parse(body);
+      const successful = {}, failed = {};
+      payload.forEach((it, i) => {
+        if (!it.itemType || !it.title) {
+          failed[String(i)] = { code: 400, message: "missing itemType or title" };
+          return;
+        }
+        const key = "NEWI" + Math.floor(Math.random() * 9000 + 1000);
+        state.items[key] = { key, version: 1, data: { ...it, key, dateAdded: new Date().toISOString() } };
+        successful[String(i)] = { key, version: 1, data: state.items[key].data };
+      });
+      return send(res, 200, { successful, failed, unchanged: {} });
     }
     if (p === "/users/1234/collections" && req.method === "POST") {
       const [c] = JSON.parse(body);
@@ -209,11 +263,138 @@ export function startWeb(port = 8123) {
     if (p === "/users/1234/items" && url.searchParams.get("format") === "bib") {
       return send(res, 200, styledFor(pickItemsFromQuery(url), url.searchParams.get("style") || "apa"));
     }
+    // ---- stand-ins for the external metadata services ----
+    if (p.startsWith("/doi/")) {
+      const doi = decodeURIComponent(p.slice(5));
+      const rec = DOI_RECORDS[doi];
+      return rec ? send(res, 200, rec) : send(res, 404, "Not found");
+    }
+    if (p === "/arxiv") {
+      const id = url.searchParams.get("id_list");
+      const rec = ARXIV_RECORDS[id];
+      return rec ? send(res, 200, rec) : send(res, 200, "<feed></feed>");
+    }
+    if (p === "/api/books") {
+      const bib = url.searchParams.get("bibkeys");
+      const rec = ISBN_RECORDS[bib];
+      return send(res, 200, rec ? { [bib]: rec } : {});
+    }
+    if (p === "/books/v1/volumes") return send(res, 200, {});
+    if (p === "/page/with-meta") {
+      return send(res, 200, PAGE_WITH_META, { "Content-Type": "text/html" });
+    }
+    if (p === "/page/bare") {
+      return send(res, 200, "<html><head><title>Just A Blog Post</title></head><body>hi</body></html>", { "Content-Type": "text/html" });
+    }
     send(res, 404, `mock web: no route ${req.method} ${p}`);
   });
   srv.listen(port);
   return srv;
 }
+
+// CSL-JSON as doi.org content negotiation returns it.
+export const DOI_RECORDS = {
+  // Shaped exactly like a live Crossref CSL transform: Crossref's own type vocabulary,
+  // publisher-location rather than publisher-place, `event` for the conference name.
+  "10.1145/3411764.3445374": {
+    DOI: "10.1145/3411764.3445374",
+    type: "proceedings-article",
+    title: "Designing for Reflection in Collaborative Systems",
+    "container-title": "Proceedings of the 2021 CHI Conference on Human Factors in Computing Systems",
+    event: "CHI '21: CHI Conference on Human Factors in Computing Systems",
+    author: [
+      { family: "Okafor", given: "Ada", sequence: "first" },
+      { family: "Lindqvist", given: "Bo", sequence: "additional" },
+    ],
+    issued: { "date-parts": [[2021, 5, 6]] },
+    page: "1-14",
+    publisher: "ACM",
+    "publisher-location": "New York, NY, USA",
+    subtitle: [],
+    ISBN: ["9781450380966"],
+  },
+  "10.9999/preprint.2024": {
+    DOI: "10.9999/preprint.2024",
+    type: "journal-article",
+    title: "A Published Version Of The Preprint",
+    "container-title": "Science &amp; Society: A Journal &#8212; Test Results",
+    author: [{ family: "Rivera", given: "Kim" }],
+    issued: { "date-parts": [[2024]] },
+    volume: "7",
+    issue: "2",
+    page: "88-101",
+    URL: "http://dx.doi.org/10.9999/preprint.2024",
+  },
+  // A preprint, as Crossref returns them: posted-content, an empty container-title array,
+  // the server named in `institution`, and a JATS-XML abstract.
+  "10.1101/2020.03.20.000133": {
+    DOI: "10.1101/2020.03.20.000133",
+    type: "posted-content",
+    title: "Deep Learning For Bioimaging Without The Barriers",
+    "container-title": [],
+    institution: [{ name: "bioRxiv" }],
+    author: [{ family: "Nguyen", given: "Thi" }],
+    issued: { "date-parts": [[2020, 3, 20]] },
+    abstract:
+      "<jats:p>\n   The resources and expertise needed to use Deep Learning remain <jats:italic>significant</jats:italic> barriers.\n   </jats:p>",
+  },
+  // A book, where Crossref says monograph and the ISBN is an array.
+  "10.1017/CBO9780511815355": {
+    DOI: "10.1017/CBO9780511815355",
+    type: "monograph",
+    title: "A Monograph About Method",
+    "container-title": [],
+    author: [{ family: "Ashby", given: "Ruth" }],
+    issued: { "date-parts": [[2011]] },
+    publisher: "Cambridge University Press",
+    "publisher-place": "Cambridge",
+    ISBN: ["9780511815355", "9780521193467"],
+  },
+};
+
+export const ARXIV_RECORDS = {
+  "2303.08774": `<feed><entry>
+    <title>Transformers For Everything</title>
+    <summary>A sweeping and slightly overconfident survey.</summary>
+    <published>2023-03-15T00:00:00Z</published>
+    <author><name>Dana Q. Fletcher</name></author>
+    <author><name>Wei Zhang</name></author>
+  </entry></feed>`,
+  "2401.00001": `<feed><entry>
+    <title>The Preprint That Got Published</title>
+    <summary>Superseded by the journal version.</summary>
+    <published>2024-01-01T00:00:00Z</published>
+    <author><name>Kim Rivera</name></author>
+    <arxiv:doi>10.9999/preprint.2024</arxiv:doi>
+  </entry></feed>`,
+};
+
+export const ISBN_RECORDS = {
+  "ISBN:9780226468013": {
+    title: "Metaphors We Live By",
+    authors: [{ name: "George Lakoff" }, { name: "Mark Johnson" }],
+    publish_date: "1980",
+    publishers: [{ name: "University of Chicago Press" }],
+    publish_places: [{ name: "Chicago" }],
+    number_of_pages: 242,
+  },
+};
+
+export const PAGE_WITH_META = `<html><head>
+  <title>Publisher page</title>
+  <meta name="citation_title" content="Situated Knowledge In Practice">
+  <meta name="citation_author" content="Haraway, Donna">
+  <meta name="citation_author" content="Chen, Li">
+  <meta name="citation_journal_title" content="Studies in Method">
+  <meta name="citation_publication_date" content="2019/07/01">
+  <meta name="citation_volume" content="12">
+  <meta name="citation_issue" content="3">
+  <meta name="citation_firstpage" content="200">
+  <meta name="citation_lastpage" content="219">
+  <meta name="citation_issn" content="1234-5678">
+  <meta name="citation_publisher" content="Method Press">
+  <meta name="dc.description" content="An abstract about situated knowledge.">
+</head><body>body text</body></html>`;
 
 // A server that accepts the connection and then says nothing, ever. Stands in for a Zotero whose
 // local API has stopped answering, which is the state that used to hang the connector indefinitely.

@@ -32,18 +32,23 @@ import {
   webDeleteCollection,
   webItemsWithTag,
   collectionSubtree,
+  getItemTemplate,
+  getCreatorTypes,
+  webCreateItems,
+  findExisting,
   pingLocal,
   LOCAL_TIMEOUT_MS,
   WEB_TIMEOUT_MS,
 } from "./zotero.js";
 import { appendEntry, readEntries, markUndone, journalPath } from "./journal.js";
+import { lookup, LookupError, zoteroTypeFor, cslToZotero } from "./identifiers.js";
 
 const ENABLE_WRITES = (process.env.ENABLE_WRITES || "true").toLowerCase() !== "false";
 // Deletion is a separate switch. It requires ENABLE_WRITES as well.
 const ENABLE_DELETES =
   ENABLE_WRITES && (process.env.ENABLE_DELETES || "true").toLowerCase() !== "false";
 
-const server = new McpServer({ name: "zotero-connector", version: "1.1.0" });
+const server = new McpServer({ name: "zotero-connector", version: "1.2.0" });
 
 const LIB_PARAM = z
   .string()
@@ -55,7 +60,7 @@ function text(s) {
 }
 
 function errText(e) {
-  const msg = e instanceof ZoteroError ? e.message : `Unexpected error: ${e.message}`;
+  const msg = e instanceof ZoteroError || e instanceof LookupError ? e.message : `Unexpected error: ${e.message}`;
   return { content: [{ type: "text", text: msg }], isError: true };
 }
 
@@ -675,6 +680,171 @@ if (ENABLE_WRITES) {
       }
     }
   );
+  server.registerTool(
+    "add_items_by_identifier",
+    {
+      title: "Add papers to Zotero from a DOI, arXiv ID, ISBN, or URL",
+      description:
+        "Look up one or more identifiers and create the matching items in the user's Zotero library. " +
+        "Accepts DOIs, arXiv IDs, ISBNs, and ordinary URLs, mixed freely in one call. Metadata comes from " +
+        "doi.org content negotiation, the arXiv API, Open Library or Google Books, and for a plain URL from " +
+        "the page's own citation meta tags. This creates the record only; it does not download the PDF. " +
+        "ALWAYS call with dry_run=true first, show the user the titles and authors that came back, and only " +
+        "call again for real once they confirm, because a wrong identifier creates a wrong item. Items that " +
+        "already appear to be in the library are skipped and reported. " +
+        `${CONFIRM_NOTE} ${SYNC_NOTE}`,
+      inputSchema: {
+        identifiers: z
+          .array(z.string())
+          .min(1)
+          .describe("DOIs, arXiv IDs, ISBNs, or URLs. Prefixes like 'doi:' or 'arXiv:' are fine."),
+        collection: z.string().optional().describe("File the new items into this collection."),
+        tags: z.array(z.string()).optional().describe("Tags to put on every new item."),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe("Look up and report what would be created, without creating anything. Use this first."),
+        allow_duplicates: z
+          .boolean()
+          .optional()
+          .describe("Create items even when a match is already in the library (default false)."),
+        library: LIB_PARAM,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false },
+    },
+    async ({ identifiers, collection, tags, dry_run, allow_duplicates, library }) => {
+      try {
+        const lib = await resolveLibrary(library);
+        const col = collection ? await resolveCollection(lib, collection) : null;
+
+        const resolved = [];
+        const failures = [];
+        const skipped = [];
+
+        for (const raw of identifiers) {
+          let found;
+          try {
+            found = await lookup(raw);
+          } catch (e) {
+            failures.push({ identifier: raw, error: e.message });
+            continue;
+          }
+          const { csl, source } = found;
+          let item;
+          try {
+            // Newer item types such as preprint and dataset do not exist in every Zotero version.
+            // Rather than fail the identifier outright, fall back to a type that always exists and
+            // let the field mapping drop whatever no longer fits.
+            const candidates = [zoteroTypeFor(csl), "document", "journalArticle"];
+            let template = null;
+            let itemType = null;
+            let lastErr = null;
+            for (const t of candidates) {
+              try {
+                template = await getItemTemplate(t);
+                itemType = t;
+                break;
+              } catch (err) {
+                lastErr = err;
+              }
+            }
+            if (!template) throw lastErr;
+            const creatorTypes = await getCreatorTypes(itemType);
+            item = cslToZotero(csl, template, { creatorTypes });
+            if (itemType !== candidates[0]) item._downgraded_from = candidates[0];
+          } catch (e) {
+            failures.push({ identifier: raw, error: `Found the record but could not build a Zotero item: ${e.message}` });
+            continue;
+          }
+
+          if (!allow_duplicates) {
+            const existing = await findExisting(lib, { doi: csl.DOI, title: item.title });
+            if (existing.length) {
+              skipped.push({
+                identifier: raw,
+                title: item.title,
+                reason: `already in the library as "${existing[0].title}" [${existing[0].key}], matched on ${existing[0].matchedOn}`,
+              });
+              continue;
+            }
+          }
+
+          const downgraded = item._downgraded_from;
+          delete item._downgraded_from;
+          if (col) item.collections = [col.key];
+          if (tags?.length) item.tags = tags.map((t) => ({ tag: t }));
+          resolved.push({ identifier: raw, source, item, downgraded });
+        }
+
+        const preview = resolved.map((r) => ({
+          identifier: r.identifier,
+          metadata_from: r.source,
+          itemType: r.item.itemType,
+          note: r.downgraded ? `Zotero here has no "${r.downgraded}" type, so this was filed as ${r.item.itemType}.` : undefined,
+          title: r.item.title,
+          creators: (r.item.creators || []).map((c) => c.name || `${c.lastName}${c.firstName ? ", " + c.firstName : ""}`),
+          date: r.item.date,
+          publication: r.item.publicationTitle || r.item.proceedingsTitle || r.item.bookTitle || r.item.repository,
+          DOI: r.item.DOI,
+          url: r.item.url,
+        }));
+
+        if (dry_run) {
+          return text({
+            dry_run: true,
+            would_create: preview,
+            would_skip_as_duplicates: skipped,
+            could_not_resolve: failures,
+            next: "Show these to the user and get confirmation, then call again without dry_run.",
+          });
+        }
+
+        if (!resolved.length) {
+          return text({ created: [], skipped_as_duplicates: skipped, could_not_resolve: failures });
+        }
+
+        // The web API takes up to 50 objects per write.
+        const created = [];
+        const writeFailures = [];
+        for (let i = 0; i < resolved.length; i += 50) {
+          const batch = resolved.slice(i, i + 50);
+          const res = await webCreateItems(lib, batch.map((r) => r.item));
+          created.push(...res.created);
+          for (const f of res.failed) {
+            writeFailures.push({ identifier: batch[f.index]?.identifier, error: f.error });
+          }
+        }
+
+        let journalId = null;
+        if (created.length) {
+          const entry = appendEntry({
+            library: lib.kind === "user" ? "user" : `group:${lib.groupID}`,
+            description:
+              `Created ${created.length} item(s) from identifiers: ` +
+              created.map((c) => c.title).join("; ") +
+              (col ? ` (filed into "${col.path}")` : ""),
+            performed: created.map((c) => ({ type: "item_create", itemKey: c.key, title: c.title })),
+            // Undo trashes them, which is recoverable, rather than erasing anything.
+            inverse: created.map((c) => ({ type: "item_trash", itemKey: c.key })).reverse(),
+          });
+          journalId = entry.id;
+        }
+
+        return text({
+          created: created.map((c) => `${c.title} [${c.key}] (${c.itemType})`),
+          filed_into: col?.path,
+          skipped_as_duplicates: skipped,
+          could_not_resolve: failures,
+          write_failures: writeFailures,
+          change_id: journalId,
+          note: `Undo moves these to the trash rather than erasing them. ${SYNC_NOTE}`,
+        });
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
 }
 
 // -------------------------------------------------------------- delete tools

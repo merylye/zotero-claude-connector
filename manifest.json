@@ -2,9 +2,9 @@
   "manifest_version": "0.2",
   "name": "zotero-connector",
   "display_name": "Zotero Connector",
-  "version": "1.1.0",
-  "description": "Read papers, notes, and citations from your Zotero library; optionally let Claude help organize it, including moving items to the trash (all reversible).",
-  "long_description": "Connects Claude to the Zotero app running on this computer. Claude can browse your collections (including group libraries), read the full text of papers, search inside PDFs, retrieve your notes and highlights, and export BibTeX or formatted bibliographies in any citation style. With a Zotero API key it can also help organize your library: creating collections, filing papers, managing tags, moving items to Zotero's trash, and deleting collections. Item records themselves are never edited, and nothing is ever erased permanently. Trashed items sit in Zotero's Trash and are recoverable there for 30 days; deleting a collection leaves its papers in the library. Every change is journaled and any change can be undone. Requires the Zotero desktop app with its local API enabled (Settings → Advanced → 'Allow other applications on this computer to communicate with Zotero').",
+  "version": "1.2.0",
+  "description": "Read papers, notes, and citations from your Zotero library, add new ones from a DOI, arXiv ID, ISBN, or URL, and optionally let Claude help organize it. All reversible.",
+  "long_description": "Connects Claude to the Zotero app running on this computer. Claude can browse your collections (including group libraries), read the full text of papers, search inside PDFs, retrieve your notes and highlights, and export BibTeX or formatted bibliographies in any citation style. With a Zotero API key it can also add new items from a DOI, arXiv ID, ISBN, or URL, and help organize your library: creating collections, filing papers, managing tags, moving items to Zotero's trash, and deleting collections. Item records are never edited, and nothing is ever erased permanently. Trashed items sit in Zotero's Trash and are recoverable there for 30 days; deleting a collection leaves its papers in the library. Every change is journaled and any change can be undone. Requires the Zotero desktop app with its local API enabled (Settings → Advanced → 'Allow other applications on this computer to communicate with Zotero').",
   "author": {
     "name": "zotero-claude-connector contributors"
   },
@@ -73,7 +73,9 @@
     "references",
     "citations",
     "research",
-    "bibliography"
+    "bibliography",
+    "doi",
+    "arxiv"
   ],
   "license": "MIT"
 }

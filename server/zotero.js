@@ -499,3 +499,110 @@ export async function webIsTrashed(lib, itemKey) {
   const it = await webGetItemForWrite(lib, itemKey);
   return { version: it.version, trashed: it.data.deleted === 1 || it.data.deleted === true, title: it.data.title };
 }
+
+// ---------- item creation ----------
+
+const templateCache = new Map();
+
+// Zotero publishes an empty template per item type, listing exactly which fields that type has.
+// Building new items against it means never sending a field Zotero would reject, and it keeps the
+// field mapping correct as Zotero adds item types. No API key needed for this endpoint.
+export async function getItemTemplate(itemType) {
+  if (templateCache.has(itemType)) return templateCache.get(itemType);
+  let res;
+  try {
+    res = await requestWithRetry(`${WEB_BASE}/items/new?itemType=${encodeURIComponent(itemType)}`, {
+      headers: { "Zotero-API-Version": "3" },
+      timeoutMs: WEB_TIMEOUT_MS,
+    });
+  } catch (e) {
+    throw new ZoteroError(`Could not reach zotero.org for the "${itemType}" item template (${e.code || e.message}).`);
+  }
+  if (!res.ok) throw new ZoteroError(`Zotero does not recognise the item type "${itemType}" (HTTP ${res.status}).`);
+  const tpl = await res.json();
+  templateCache.set(itemType, tpl);
+  return tpl;
+}
+
+// The creator types a given item type accepts, e.g. a book has bookAuthor, a thesis does not.
+export async function getCreatorTypes(itemType) {
+  const key = `creators:${itemType}`;
+  if (templateCache.has(key)) return templateCache.get(key);
+  try {
+    const res = await requestWithRetry(
+      `${WEB_BASE}/itemTypeCreatorTypes?itemType=${encodeURIComponent(itemType)}`,
+      { headers: { "Zotero-API-Version": "3" }, timeoutMs: WEB_TIMEOUT_MS }
+    );
+    if (res.ok) {
+      const types = (await res.json()).map((t) => t.creatorType);
+      if (types.length) {
+        templateCache.set(key, types);
+        return types;
+      }
+    }
+  } catch (e) {
+    // Fall through to the safe default.
+  }
+  return ["author"];
+}
+
+export async function webCreateItems(lib, items) {
+  const prefix = await webPrefix(lib);
+  const res = await webFetch(`${prefix}/items`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(items),
+  });
+  if (!res.ok) throw new ZoteroError(`Could not create items: ${res.status} ${await res.text()}`);
+  const out = await res.json();
+  const created = [];
+  const failed = [];
+  items.forEach((_, i) => {
+    const ok = out.successful?.[String(i)];
+    if (ok) created.push({ key: ok.key, title: ok.data?.title || "(untitled)", itemType: ok.data?.itemType });
+    else failed.push({ index: i, error: out.failed?.[String(i)]?.message || "unknown error" });
+  });
+  return { created, failed };
+}
+
+function normaliseTitle(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+// Look for something already in the library that this identifier would duplicate. Matching on DOI
+// is exact; matching on title is a normalised string compare, which catches the common case of the
+// same paper saved twice and misses reprints under a changed title.
+export async function findExisting(lib, { doi, title }) {
+  const hits = [];
+  const seen = new Set();
+  const scan = async (q, qmode) => {
+    if (!q) return [];
+    const params = new URLSearchParams({ q, qmode, format: "json", limit: "25" });
+    try {
+      return await localGET(`${lib.localPrefix}/items/top?${params}`);
+    } catch (e) {
+      return [];
+    }
+  };
+  if (doi) {
+    for (const it of await scan(doi, "everything")) {
+      const d = it.data || {};
+      const inField = (d.DOI || "").toLowerCase() === doi.toLowerCase();
+      const inExtra = (d.extra || "").toLowerCase().includes(doi.toLowerCase());
+      if ((inField || inExtra) && !seen.has(it.key)) {
+        seen.add(it.key);
+        hits.push({ key: it.key, title: d.title, matchedOn: "DOI" });
+      }
+    }
+  }
+  if (!hits.length && title) {
+    const target = normaliseTitle(title);
+    for (const it of await scan(title, "titleCreatorYear")) {
+      if (normaliseTitle(it.data?.title) === target && !seen.has(it.key)) {
+        seen.add(it.key);
+        hits.push({ key: it.key, title: it.data.title, matchedOn: "title" });
+      }
+    }
+  }
+  return hits;
+}

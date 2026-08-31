@@ -34,8 +34,9 @@ Reading, through Zotero's local API, with no API key and no cloud round-trip:
 - retrieve your own notes and the highlights you made in Zotero's reader
 - export BibTeX, or a formatted bibliography in APA, Chicago, MLA, or any CSL style
 
-Organizing, through the Zotero web API, which needs an API key:
+Adding and organizing, through the Zotero web API, which needs an API key:
 
+- create items from a DOI, an arXiv ID, an ISBN, or a URL, filed and tagged on the way in
 - create collections, file papers into them, remove them from collections
 - add, remove, and rename tags
 - move items to Zotero's trash, and restore them
@@ -49,7 +50,7 @@ History:
 
 ## Install
 
-1. Download `dist/zotero-connector-1.1.0.mcpb` from this repo.
+1. Download `dist/zotero-connector-1.2.0.mcpb` from this repo.
 2. In Zotero, open **Settings → Advanced** and check
    **"Allow other applications on this computer to communicate with Zotero"**.
 3. Double-click the `.mcpb`, or drag it onto the Claude Desktop window, and click Install.
@@ -74,11 +75,12 @@ in the group library 'CogSci Lab'").
 Then ask ordinary questions. "What's in my Chapter 2 folder?" "Do any papers in Metaphor Study and
 Unsorted relate to embodied simulation?" "Read the Glucksberg paper and compare its model to Chen's."
 "What did I highlight in Lakoff?" "Give me a .bib for the whole collection." "Create a To Read
-subcollection and file everything tagged to-read into it."
+subcollection and file everything tagged to-read into it." "Add 10.1145/3411764.3445374 and
+arXiv:2303.08774 to my Chapter 2 folder."
 
 ## Tool reference
 
-Sixteen tools. Most take an optional `library`, which is `"user"` (the default, your personal
+Seventeen tools. Most take an optional `library`, which is `"user"` (the default, your personal
 library) or a group library's name or ID. Papers are identified by their 8-character Zotero item key
 or by title; collections by name, by a `Parent/Child` path, or by key.
 
@@ -94,6 +96,28 @@ or by title; collections by name, by a `Parent/Child` path, or by key.
 | `read_paper` | `item`, `offset`, `max_chars` | Full text in chunks, with metadata and the PDF's path on disk. Defaults to 80,000 characters and reports how much remains |
 | `get_notes_and_annotations` | `item` | Your notes with HTML stripped, and highlights from Zotero's reader with page, colour, and comment |
 | `export_bibliography` | `collection` or `items[]`, `format`, `style` | `format: "bibtex"` for a .bib, `format: "styled"` for prose in any CSL style (`apa`, `chicago-note-bibliography`, and so on) |
+
+### Adding items (web API, needs a key)
+
+| Tool | Parameters | Effect |
+| --- | --- | --- |
+| `add_items_by_identifier` | `identifiers[]`, `collection`, `tags[]`, `dry_run`, `allow_duplicates` | Looks up DOIs, arXiv IDs, ISBNs, and URLs, and creates the matching Zotero items. `dry_run` reports what it found without writing, which is the intended first call. Items already in the library are skipped and reported. Creates the record only, not the PDF |
+
+Metadata sources, in the order the tool tries them:
+
+| Identifier | Source | Quality |
+| --- | --- | --- |
+| DOI | `doi.org` content negotiation, returning CSL-JSON from Crossref, DataCite, or whichever agency registered it | Very good. This is the case to prefer |
+| arXiv ID | the arXiv API. If the preprint reports a published DOI, that DOI is used instead | Very good |
+| ISBN | Open Library, falling back to Google Books | Decent. Publisher and page counts vary |
+| URL | `citation_*`, Dublin Core, and Open Graph meta tags on the page. A page declaring a `citation_doi` is re-routed through the DOI path | Good on publishers and preprint servers, poor on blogs and JavaScript-rendered pages |
+
+Items are built against Zotero's own item templates, fetched from the API, so only fields the item type
+actually has are sent and the mapping keeps working as Zotero adds types. Anything with no home, such as a
+DOI on a book, goes into `extra`, where Zotero users put it by hand anyway.
+
+For a page with no usable metadata, save it with Zotero's browser button instead. That has a translator
+written for the site; this does not.
 
 ### Organizing (web API, needs a key)
 
@@ -153,6 +177,8 @@ indefinitely. See the [changelog](CHANGELOG.md) for the full account.
 - Write tools default to propose-then-confirm. Saying "go ahead without asking" in a chat covers
   filing and tagging, and deliberately does not cover deletion, which is confirmed every time.
 - Undo recreates deleted folders, restores their nesting, and refiles the papers that were in them.
+- Undoing an item created from an identifier moves it to the trash rather than erasing it, so an undo
+  is never destructive either.
 - Your API key is stored by Claude Desktop and passed to the server as an environment variable. It
   is never written to disk by this code and never leaves your machine except to api.zotero.org.
 
@@ -167,6 +193,8 @@ indefinitely. See the [changelog](CHANGELOG.md) for the full account.
   cannot be retrieved.
 - Writes go through zotero.org and appear in the desktop app on its next sync, usually within
   seconds.
+- Adding items by identifier reaches out to doi.org, arxiv.org, openlibrary.org, googleapis.com, or the
+  page you name. Everything else works with no outbound traffic beyond zotero.org.
 
 ## Troubleshooting
 
@@ -200,6 +228,7 @@ The build writes `dist/zotero-connector-<version>.mcpb`. Requires Node 18 or new
 server/index.js    MCP tool definitions and the write/undo plumbing
 server/zotero.js   local API and web API clients, collection and item resolution
 server/http.js     HTTP transport: per-request deadlines, no socket reuse, retry on reads
+server/identifiers.js  DOI, arXiv, ISBN, and URL lookup, and the CSL-JSON to Zotero mapping
 server/journal.js  the on-disk change journal
 test/              a mock Zotero (local + web API) and an end-to-end suite over stdio
 ```
