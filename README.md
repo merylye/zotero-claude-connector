@@ -14,7 +14,7 @@ errors, data loss, or damage arising from its use. Use it at your own risk.**
 
 That is what the [MIT license](LICENSE) says in legal terms, and it is worth saying plainly here
 too, because this tool can change your Zotero library. It can file papers, edit tags, move items to
-Zotero's trash, and delete collections. It cannot erase anything permanently, and every change it
+Zotero's trash, delete collections, and merge duplicate items. It cannot erase anything permanently, and every change it
 makes is journaled and reversible, but no amount of care in the code substitutes for your own
 backup. **Back up your Zotero library before giving any tool write access to it**, including this
 one. Zotero's own sync is not a backup; it will happily propagate a mistake to every device you own.
@@ -33,6 +33,8 @@ Reading, through Zotero's local API, with no API key and no cloud round-trip:
 - read a paper's full text, chunked, with the PDF's path on disk
 - retrieve your own notes and the highlights you made in Zotero's reader
 - export BibTeX, or a formatted bibliography in APA, Chicago, MLA, or any CSL style
+- find probable duplicates by DOI or title, including a paper saved alongside its publisher page and
+  a preprint alongside its published version
 
 Adding and organizing, through the Zotero web API, which needs an API key:
 
@@ -41,6 +43,8 @@ Adding and organizing, through the Zotero web API, which needs an API key:
 - add, remove, and rename tags
 - move items to Zotero's trash, and restore them
 - delete a collection, leaving its papers in the library
+- merge duplicates the way Zotero's Merge Duplicates does: notes, PDFs and highlights move onto the
+  copy you keep, along with its folders and tags, and the spare copy goes to the trash
 
 History:
 
@@ -50,7 +54,7 @@ History:
 
 ## Install
 
-1. Download `dist/zotero-connector-1.2.0.mcpb` from this repo.
+1. Download `dist/zotero-connector-1.3.0.mcpb` from this repo.
 2. In Zotero, open **Settings → Advanced** and check
    **"Allow other applications on this computer to communicate with Zotero"**.
 3. Double-click the `.mcpb`, or drag it onto the Claude Desktop window, and click Install.
@@ -80,7 +84,7 @@ arXiv:2303.08774 to my Chapter 2 folder."
 
 ## Tool reference
 
-Seventeen tools. Most take an optional `library`, which is `"user"` (the default, your personal
+Nineteen tools. Most take an optional `library`, which is `"user"` (the default, your personal
 library) or a group library's name or ID. Papers are identified by their 8-character Zotero item key
 or by title; collections by name, by a `Parent/Child` path, or by key.
 
@@ -96,6 +100,7 @@ or by title; collections by name, by a `Parent/Child` path, or by key.
 | `read_paper` | `item`, `offset`, `max_chars` | Full text in chunks, with metadata and the PDF's path on disk. Defaults to 80,000 characters and reports how much remains |
 | `get_notes_and_annotations` | `item` | Your notes with HTML stripped, and highlights from Zotero's reader with page, colour, and comment |
 | `export_bibliography` | `collection` or `items[]`, `format`, `style` | `format: "bibtex"` for a .bib, `format: "styled"` for prose in any CSL style (`apa`, `chicago-note-bibliography`, and so on) |
+| `find_duplicates` | `collection`, `max_groups` | Groups of probable duplicates, matched on a shared DOI (from the DOI field, a `DOI:` line in Extra, or a doi.org URL) or on a title that matches once case, punctuation and a publisher-site suffix are ignored. Titles under four words are never matched. Each group lists every copy with its type, folders, and note and attachment counts, and suggests which to keep |
 
 ### Adding items (web API, needs a key)
 
@@ -134,6 +139,7 @@ written for the site; this does not.
 | --- | --- | --- |
 | `delete_items` | `items[]`, `action` | `trash` moves items to Zotero's Trash, recoverable there for 30 days. `restore` brings them back. Identify trashed items by key, since they leave the search index |
 | `delete_collection` | `collection`, `include_subcollections` | Deletes the folder and leaves its papers in the library. Refuses on a folder with subfolders unless the flag is set |
+| `merge_items` | `keep`, `duplicates[]`, `dry_run` | Folds each duplicate into the kept copy: moves its notes and attachments (highlights travel with their PDF), adds the kept copy to its folders, copies its tags and related-item links, records that the kept copy replaces it, then trashes it. The kept copy's metadata is not touched. If any step fails for a duplicate, that duplicate stays in the library. One undo reverses the whole merge |
 
 ### History
 
@@ -160,6 +166,15 @@ done. Each entry holds the operations performed and their exact inverses, which 
 real rather than a best guess. Collection deletion captures the whole subtree, its nesting and its
 membership, before removing anything, so undo rebuilds the folders and refiles every paper.
 
+**Merging is rebuilt from Web API steps.** Zotero's own merge lives inside the desktop app and is not
+exposed by either API, so `merge_items` performs the same steps one at a time. Each note and
+attachment of the duplicate is re-parented onto the kept copy, which brings its PDF file and every
+highlight on it along. The kept copy is added to the duplicate's folders and given its tags. A
+`dc:replaces` relation pointing at the duplicate is added to the kept copy, which is what Zotero
+writes too, and is how citations in Word or Google Docs that referenced the duplicate keep
+resolving. Only then is the duplicate trashed. The one thing Zotero's dialog does that this does not
+is let you pick individual fields from the other copy; the kept copy's metadata stays as it is.
+
 **Every request has a deadline.** The transport in `server/http.js` opens a fresh connection per
 request and times out on connect, headers, and body read. Reads retry once; writes never retry
 automatically, so a change cannot be applied twice. This exists because Node's global `fetch` pools
@@ -168,7 +183,9 @@ indefinitely. See the [changelog](CHANGELOG.md) for the full account.
 
 ## Safety model
 
-- Item records are never edited. Titles, authors, dates, and abstracts are read-only.
+- Item metadata is never edited. Titles, authors, dates, and abstracts are read-only. The only
+  record-level edits are the two a merge needs: changing which item a note or attachment belongs to,
+  and adding a `dc:replaces` link to the kept copy. Both are journaled and undone exactly.
 - Nothing is erased permanently. Trashed items sit in Zotero's Trash, recoverable there for 30 days.
   Emptying the trash is left to you, in Zotero. Deleting a collection leaves its papers in the
   library.
@@ -179,6 +196,10 @@ indefinitely. See the [changelog](CHANGELOG.md) for the full account.
 - Undo recreates deleted folders, restores their nesting, and refiles the papers that were in them.
 - Undoing an item created from an identifier moves it to the trash rather than erasing it, so an undo
   is never destructive either.
+- A merge trashes a duplicate only after every other step for it has succeeded, so a failure never
+  leaves notes or PDFs hidden under an item in the trash. Undoing a merge restores the duplicate and
+  moves its notes and attachments back, except any you have since moved by hand, which stay put.
+- Merging trashes items, so it sits under the deletion switch and is confirmed every time.
 - Your API key is stored by Claude Desktop and passed to the server as an environment variable. It
   is never written to disk by this code and never leaves your machine except to api.zotero.org.
 

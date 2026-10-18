@@ -494,6 +494,42 @@ export async function collectionSubtree(lib, rootKey) {
   return ordered;
 }
 
+// ---------- merge support ----------
+
+// The URI Zotero itself uses to refer to an item in relations such as dc:replaces.
+export async function itemURI(lib, itemKey) {
+  if (lib.kind === "user") return `http://zotero.org/users/${await getUserID()}/items/${itemKey}`;
+  return `http://zotero.org/groups/${lib.groupID}/items/${itemKey}`;
+}
+
+// Direct children (notes and attachments) of an item, read from zotero.org so that the versions
+// match what the following writes will be checked against. Annotations hang off attachments and
+// travel with them, so they are not listed separately.
+export async function webGetChildren(lib, itemKey) {
+  const prefix = await webPrefix(lib);
+  const out = [];
+  let start = 0;
+  for (;;) {
+    const res = await webFetch(`${prefix}/items/${itemKey}/children?format=json&limit=100&start=${start}`);
+    if (!res.ok) throw new ZoteroError(`Could not list attachments and notes of ${itemKey}: ${res.status}`);
+    const page = await res.json();
+    out.push(...page);
+    if (page.length < 100) break;
+    start += 100;
+  }
+  return out.filter((c) => ["note", "attachment"].includes(c.data?.itemType));
+}
+
+// Every regular top-level item in a library (or one collection), with full data. Used by the
+// duplicate scan. Trashed items are excluded by the API.
+export async function getAllTopItems(lib, colKey) {
+  const path = colKey
+    ? `${lib.localPrefix}/collections/${colKey}/items/top?format=json&limit=100000`
+    : `${lib.localPrefix}/items/top?format=json&limit=100000`;
+  const items = await localGET(path, { timeoutMs: SLOW_TIMEOUT_MS });
+  return items.filter((i) => !["attachment", "note", "annotation"].includes(i.data?.itemType));
+}
+
 // True if the item is already in Zotero's trash.
 export async function webIsTrashed(lib, itemKey) {
   const it = await webGetItemForWrite(lib, itemKey);

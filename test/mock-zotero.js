@@ -200,9 +200,14 @@ export function startWeb(port = 8123) {
       const it = state.items[mm[1]];
       return it ? send(res, 200, it) : send(res, 404, "Not found");
     }
+    if ((mm = m(/^\/users\/1234\/items\/(\w+)\/children$/)) && req.method === "GET") {
+      return send(res, 200, childrenOf(mm[1]));
+    }
     if ((mm = m(/^\/users\/1234\/items\/(\w+)$/)) && req.method === "PATCH") {
       const it = state.items[mm[1]];
       if (!it) return send(res, 404, "Not found");
+      // Keys starting BAD stand in for a write zotero.org rejects, to test partial-failure handling.
+      if (mm[1].startsWith("BAD")) return send(res, 500, "Simulated server error");
       const ifV = Number(req.headers["if-unmodified-since-version"]);
       if (ifV !== it.version) return send(res, 412, "Precondition failed");
       Object.assign(it.data, JSON.parse(body));

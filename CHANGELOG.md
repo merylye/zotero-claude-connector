@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.3.0 (2026-10-18)
+
+### Added
+- **`merge_items`.** Merges duplicate items the way Zotero's Merge Duplicates does, rebuilt from Web API
+  steps because Zotero's own merge is not exposed by either API. For each duplicate it re-parents the
+  duplicate's notes and attachments onto the kept copy (highlights travel with their PDF), adds the kept
+  copy to the duplicate's collections, copies its tags with their type and its `dc:relation` links, adds
+  a `dc:replaces` relation so word-processor citations of the duplicate still resolve, and then moves
+  the duplicate to the trash. `dry_run` shows the plan first. The whole merge is one journal entry, so
+  one undo reverses it.
+- **`find_duplicates`.** Scans the library or one collection for probable duplicates. Items are grouped
+  when they share a DOI, read from the DOI field, a `DOI:` line in Extra, or a doi.org URL, or when their
+  titles match after folding case and punctuation and dropping a publisher-site suffix from saved
+  webpages. Matching is transitive. Titles under four words or 25 characters are never matched, since
+  "Introduction" is not evidence of anything. Each group suggests which copy to keep: published over
+  preprint over saved webpage, then the one with a DOI, then the one with the most notes and
+  attachments, then the oldest.
+
+### Changed
+- The rule that item records are never edited is narrowed rather than dropped. Metadata is still never
+  written. A merge edits two things only: a child's `parentItem`, and the kept copy's `relations`.
+- `tag_add` preserves a tag's type, so automatic tags stay automatic when they move in a merge.
+
+### Safety
+- A duplicate is trashed only after every other step for it has succeeded. If re-parenting a note fails,
+  the duplicate stays in the library with the note still under it, and the steps that did succeed are
+  journaled so they can be undone.
+- Undoing a merge will not move a note or attachment that has since been re-filed by hand. It reports
+  the skip and completes the rest.
+- Merging requires the deletion switch, since it trashes items, and is confirmed every time.
+
+### Known limits
+- The kept copy's metadata is kept as is. Zotero's dialog lets you take individual fields from the other
+  version; this does not.
+- Other items whose related-item links point at the duplicate keep pointing at it.
+- Tested against the mock Web API. Whether zotero.org accepts a `parentItem` change on every attachment
+  type is confirmed on the first live merge rather than assumed.
+
 ## 1.2.0 (2026-08-29)
 
 ### Added

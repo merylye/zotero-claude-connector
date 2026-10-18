@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Zotero Connector for Claude — local-first MCP server.
 // Reads via Zotero's local API (Zotero must be open); writes via the Zotero web API (API key),
-// limited to collection membership and tags, with a journal so every change can be undone.
+// limited to collection membership, tags, the trash, collection deletion, and merging duplicates,
+// with a journal so every change can be undone.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -36,19 +37,23 @@ import {
   getCreatorTypes,
   webCreateItems,
   findExisting,
+  itemURI,
+  webGetChildren,
+  getAllTopItems,
   pingLocal,
   LOCAL_TIMEOUT_MS,
   WEB_TIMEOUT_MS,
 } from "./zotero.js";
 import { appendEntry, readEntries, markUndone, journalPath } from "./journal.js";
 import { lookup, LookupError, zoteroTypeFor, cslToZotero } from "./identifiers.js";
+import { groupDuplicates, rankForKeeping, keepReason, itemDOI } from "./duplicates.js";
 
 const ENABLE_WRITES = (process.env.ENABLE_WRITES || "true").toLowerCase() !== "false";
 // Deletion is a separate switch. It requires ENABLE_WRITES as well.
 const ENABLE_DELETES =
   ENABLE_WRITES && (process.env.ENABLE_DELETES || "true").toLowerCase() !== "false";
 
-const server = new McpServer({ name: "zotero-connector", version: "1.2.0" });
+const server = new McpServer({ name: "zotero-connector", version: "1.3.0" });
 
 const LIB_PARAM = z
   .string()
@@ -411,6 +416,82 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "find_duplicates",
+  {
+    title: "Find duplicate items",
+    description:
+      "Scan the library (or one collection) for probable duplicates: items sharing a DOI, or items whose " +
+      "titles match once case, punctuation and a publisher-site suffix are ignored. Catches the same paper " +
+      "saved twice, a paper plus a saved webpage of its publisher page, and a preprint plus its published " +
+      "version. Each group lists every copy with its type, year, DOI, folders, and how many notes and " +
+      "attachments it carries, and suggests which copy to keep (published over preprint over webpage, then " +
+      "DOI, then most notes and attachments). Read-only. Use merge_items to act on a group after the user " +
+      "approves it.",
+    inputSchema: {
+      collection: z.string().optional().describe("Only scan this collection (name/path/key). Default: whole library."),
+      library: LIB_PARAM,
+      max_groups: z.number().optional().describe("Return at most this many groups (default 100)."),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ collection, library, max_groups = 100 }) => {
+    try {
+      const lib = await resolveLibrary(library);
+      const col = collection ? await resolveCollection(lib, collection) : null;
+      const items = await getAllTopItems(lib, col?.key);
+      const groups = groupDuplicates(items);
+      const cols = await getAllCollections(lib);
+      const colByKey = new Map(cols.map((c) => [c.key, c]));
+      const colName = (k) => (colByKey.has(k) ? collectionPath(colByKey.get(k), colByKey) : `(unknown collection ${k})`);
+      const out = [];
+      for (const g of groups.slice(0, max_groups)) {
+        const childCounts = {};
+        const detail = {};
+        for (const m of g.members) {
+          const kids = await getChildren(lib, m.key);
+          const notes = kids.filter((k) => k.data.itemType === "note").length;
+          const attachments = kids.filter((k) => k.data.itemType === "attachment").length;
+          childCounts[m.key] = notes + attachments;
+          detail[m.key] = { notes, attachments };
+        }
+        const ranked = rankForKeeping(g.members, childCounts);
+        const best = ranked[0];
+        out.push({
+          matched_on: g.matchedOn,
+          suggested_keep: best.key,
+          why: keepReason(best, ranked.slice(1)),
+          caution: g.caution.length ? g.caution : undefined,
+          copies: ranked.map((m) => ({
+            key: m.key,
+            itemType: m.data.itemType,
+            title: m.data.title,
+            year: (m.data.date || "").match(/\d{4}/)?.[0] || "",
+            DOI: itemDOI(m.data) || undefined,
+            folders: (m.data.collections || []).map(colName),
+            notes: detail[m.key].notes,
+            attachments: detail[m.key].attachments,
+            dateAdded: m.data.dateAdded,
+          })),
+        });
+      }
+      return text({
+        library: lib.label,
+        scanned: col ? col.path : "whole library",
+        items_scanned: items.length,
+        duplicate_groups: groups.length,
+        shown: out.length,
+        groups: out,
+        next:
+          "Show the user each group with the suggested copy to keep, and get approval before calling merge_items. " +
+          "For preprint/published pairs, keep the published version unless the user says otherwise.",
+      });
+    } catch (e) {
+      return errText(e);
+    }
+  }
+);
+
 // ------------------------------------------------------------ write plumbing
 
 // Primitive operations; each returns true if it changed something.
@@ -434,7 +515,8 @@ async function applyPrimitive(lib, p) {
       const it = await webGetItemForWrite(lib, p.itemKey);
       const tags = it.data.tags || [];
       if (tags.some((t) => t.tag === p.tag)) return false;
-      await webPatchItem(lib, p.itemKey, it.version, { tags: [...tags, { tag: p.tag }] });
+      const newTag = p.tagType ? { tag: p.tag, type: p.tagType } : { tag: p.tag };
+      await webPatchItem(lib, p.itemKey, it.version, { tags: [...tags, newTag] });
       return true;
     }
     case "tag_remove": {
@@ -483,6 +565,41 @@ async function applyPrimitive(lib, p) {
       }
       return true;
     }
+    case "item_reparent": {
+      // Move a note or attachment from one parent item to another. Refuses if the child has since
+      // been moved somewhere else, so an undo never drags it away from a parent the user chose.
+      const it = await webGetItemForWrite(lib, p.itemKey);
+      const current = it.data.parentItem || null;
+      if (current === p.to) return false;
+      if (current !== p.from) {
+        throw new ZoteroError(
+          `"${it.data.title || p.itemKey}" is no longer attached to ${p.from} (it is under ${current || "nothing"}), so it was left where it is.`
+        );
+      }
+      await webPatchItem(lib, p.itemKey, it.version, { parentItem: p.to });
+      return true;
+    }
+    case "relation_add": {
+      const it = await webGetItemForWrite(lib, p.itemKey);
+      const rel = { ...(it.data.relations || {}) };
+      const vals = rel[p.predicate] == null ? [] : [].concat(rel[p.predicate]);
+      if (vals.includes(p.object)) return false;
+      const next = [...vals, p.object];
+      rel[p.predicate] = next.length === 1 ? next[0] : next;
+      await webPatchItem(lib, p.itemKey, it.version, { relations: rel });
+      return true;
+    }
+    case "relation_remove": {
+      const it = await webGetItemForWrite(lib, p.itemKey);
+      const rel = { ...(it.data.relations || {}) };
+      const vals = rel[p.predicate] == null ? [] : [].concat(rel[p.predicate]);
+      if (!vals.includes(p.object)) return false;
+      const next = vals.filter((v) => v !== p.object);
+      if (next.length === 0) delete rel[p.predicate];
+      else rel[p.predicate] = next.length === 1 ? next[0] : next;
+      await webPatchItem(lib, p.itemKey, it.version, { relations: rel });
+      return true;
+    }
     default:
       throw new ZoteroError(`Unknown operation type ${p.type}`);
   }
@@ -504,6 +621,12 @@ function inverseOf(p) {
       return { ...p, type: "item_trash" };
     case "collection_create":
       return { type: "collection_delete", collectionKey: p.collectionKey };
+    case "item_reparent":
+      return { ...p, from: p.to, to: p.from };
+    case "relation_add":
+      return { ...p, type: "relation_remove" };
+    case "relation_remove":
+      return { ...p, type: "relation_add" };
     default:
       return null;
   }
@@ -978,6 +1101,172 @@ if (ENABLE_DELETES) {
           errors,
           change_id: journalId,
           note: `Undo recreates the folder(s) and refiles their papers. ${SYNC_NOTE}`,
+        });
+      } catch (e) {
+        return errText(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "merge_items",
+    {
+      title: "Merge duplicate items",
+      description:
+        "Merge one or more duplicate copies into the copy being kept, the way Zotero's Merge Duplicates does. " +
+        "For each duplicate it (1) moves its notes, attachments and PDFs (with their highlights) onto the kept " +
+        "copy, (2) adds the kept copy to every folder the duplicate was in, (3) copies over the duplicate's " +
+        "tags and related-item links, (4) records on the kept copy that it replaces the duplicate, which keeps " +
+        "Word and Google Docs citations that pointed at the duplicate working, and (5) moves the duplicate to " +
+        "Zotero's trash. The kept copy's own metadata (title, authors, fields) is never changed. If any step " +
+        "for a duplicate fails, that duplicate is NOT trashed, so nothing ends up stranded in the trash. One " +
+        "undo_changes call reverses the whole merge. Identify items by key, since duplicates share titles. " +
+        "Call with dry_run=true first and show the user the plan. " +
+        `${DELETE_NOTE} ${SYNC_NOTE}`,
+      inputSchema: {
+        keep: z.string().regex(/^[A-Z0-9]{8}$/).describe("Key of the copy to keep."),
+        duplicates: z
+          .array(z.string().regex(/^[A-Z0-9]{8}$/))
+          .min(1)
+          .describe("Keys of the copies to fold into it and then trash."),
+        dry_run: z.boolean().optional().describe("Report the plan without changing anything. Use this first."),
+        library: LIB_PARAM,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    async ({ keep, duplicates, dry_run, library }) => {
+      try {
+        const lib = await resolveLibrary(library);
+        const dupKeys = [...new Set(duplicates)].filter((k) => k !== keep);
+        if (!dupKeys.length) return errText(new ZoteroError("List at least one duplicate that differs from the kept copy."));
+
+        const isRegular = (it) => !["note", "attachment", "annotation"].includes(it.data.itemType);
+        const isTrashed = (it) => it.data.deleted === 1 || it.data.deleted === true;
+
+        const master = await webGetItemForWrite(lib, keep);
+        if (!isRegular(master)) return errText(new ZoteroError(`${keep} is a ${master.data.itemType}, not a paper; it cannot be the kept copy.`));
+        if (isTrashed(master)) return errText(new ZoteroError(`${keep} ("${master.data.title}") is in the trash. Restore it first or keep a different copy.`));
+
+        const cols = await getAllCollections(lib);
+        const colByKey = new Map(cols.map((c) => [c.key, c]));
+        const colName = (k) => (colByKey.has(k) ? collectionPath(colByKey.get(k), colByKey) : k);
+        const masterURI = await itemURI(lib, keep);
+
+        const plans = [];
+        const refused = [];
+        const willHaveCols = new Set(master.data.collections || []);
+        const willHaveTags = new Set((master.data.tags || []).map((t) => t.tag));
+        for (const dk of dupKeys) {
+          let dup;
+          try {
+            dup = await webGetItemForWrite(lib, dk);
+          } catch (e) {
+            refused.push({ key: dk, reason: e.message });
+            continue;
+          }
+          if (!isRegular(dup)) {
+            refused.push({ key: dk, reason: `it is a ${dup.data.itemType}, not a paper` });
+            continue;
+          }
+          if (isTrashed(dup)) {
+            refused.push({ key: dk, reason: "it is already in the trash" });
+            continue;
+          }
+          const children = await webGetChildren(lib, dk);
+          const prims = [];
+          for (const c of children) prims.push({ type: "item_reparent", itemKey: c.key, from: dk, to: keep, title: c.data.title || c.data.itemType });
+          const addCols = (dup.data.collections || []).filter((k) => !willHaveCols.has(k));
+          for (const k of addCols) {
+            willHaveCols.add(k);
+            prims.push({ type: "collection_add", itemKey: keep, collectionKey: k });
+          }
+          const addTags = (dup.data.tags || []).filter((t) => !willHaveTags.has(t.tag));
+          for (const t of addTags) {
+            willHaveTags.add(t.tag);
+            prims.push({ type: "tag_add", itemKey: keep, tag: t.tag, tagType: t.type || undefined });
+          }
+          // Carry over what the duplicate itself replaced or was related to, the way Zotero does.
+          const dupRel = dup.data.relations || {};
+          const replaced = [await itemURI(lib, dk), ...[].concat(dupRel["dc:replaces"] || [])];
+          for (const uri of replaced) prims.push({ type: "relation_add", itemKey: keep, predicate: "dc:replaces", object: uri });
+          for (const uri of [].concat(dupRel["dc:relation"] || [])) {
+            if (uri !== masterURI) prims.push({ type: "relation_add", itemKey: keep, predicate: "dc:relation", object: uri });
+          }
+          plans.push({
+            key: dk,
+            title: dup.data.title,
+            itemType: dup.data.itemType,
+            moves: children.map((c) => `${c.data.itemType}: ${c.data.title || (c.data.note || "").replace(/<[^>]+>/g, "").slice(0, 60) || c.key}`),
+            adds_folders: addCols.map(colName),
+            adds_tags: addTags.map((t) => t.tag),
+            prims,
+          });
+        }
+
+        const summary = {
+          keep: `${master.data.title} [${keep}] (${master.data.itemType})`,
+          merging: plans.map((p) => ({
+            duplicate: `${p.title} [${p.key}] (${p.itemType})`,
+            notes_and_attachments_moved: p.moves.length ? p.moves : "none",
+            folders_added_to_kept_copy: p.adds_folders.length ? p.adds_folders : "none",
+            tags_added_to_kept_copy: p.adds_tags.length ? p.adds_tags : "none",
+            then: "duplicate moves to the trash",
+          })),
+          refused: refused.length ? refused : undefined,
+        };
+        if (dry_run || !plans.length) {
+          return text({
+            dry_run: !!dry_run,
+            ...summary,
+            next: plans.length ? "Show this plan to the user and get approval, then call again without dry_run." : "Nothing to merge.",
+          });
+        }
+
+        const performed = [];
+        const results = [];
+        for (const p of plans) {
+          const errors = [];
+          for (const prim of p.prims) {
+            try {
+              if (await applyPrimitive(lib, prim)) performed.push(prim);
+            } catch (e) {
+              errors.push(e.message);
+            }
+          }
+          let trashed = false;
+          if (!errors.length) {
+            try {
+              const trashOp = { type: "item_trash", itemKey: p.key };
+              if (await applyPrimitive(lib, trashOp)) performed.push(trashOp);
+              trashed = true;
+            } catch (e) {
+              errors.push(`Could not move the duplicate to the trash: ${e.message}`);
+            }
+          }
+          results.push({
+            duplicate: `${p.title} [${p.key}]`,
+            merged: trashed,
+            errors: errors.length ? errors : undefined,
+            note: errors.length && !trashed ? "Left in the library because a step failed; nothing was stranded in the trash." : undefined,
+          });
+        }
+
+        let journalId = null;
+        if (performed.length) {
+          const entry = appendEntry({
+            library: lib.kind === "user" ? "user" : `group:${lib.groupID}`,
+            description: `Merged ${results.filter((r) => r.merged).length} duplicate(s) into "${master.data.title}" [${keep}]: ${plans.map((p) => p.key).join(", ")}`,
+            performed,
+            inverse: performed.map(inverseOf).filter(Boolean).reverse(),
+          });
+          journalId = entry.id;
+        }
+        return text({
+          kept: summary.keep,
+          results,
+          refused: refused.length ? refused : undefined,
+          change_id: journalId,
+          note: `One undo_changes call with this change_id reverses the whole merge. ${SYNC_NOTE}`,
         });
       } catch (e) {
         return errText(e);

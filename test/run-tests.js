@@ -44,7 +44,8 @@ async function call(name, args = {}) {
 // tool listing
 const tools = (await client.listTools()).tools.map((t) => t.name).sort();
 console.log("tools:", tools.join(", "));
-check("all 17 tools registered", tools.length === 17, tools.join(", "));
+check("all 19 tools registered", tools.length === 19, tools.join(", "));
+check("merge tools registered", tools.includes("merge_items") && tools.includes("find_duplicates"));
 check("delete tools registered", tools.includes("delete_items") && tools.includes("delete_collection"));
 
 // check_status
@@ -280,6 +281,121 @@ check("created item is live", state.items[madeKey]?.data.deleted !== 1);
 r = await call("undo_changes", { change_ids: [undoTarget] });
 check("undo trashes the created item", state.items[madeKey]?.data.deleted === 1, r.text.slice(0, 400));
 check("undo does not erase the record", !!state.items[madeKey]);
+
+
+// ---- duplicates and merging ----
+
+// A saved publisher page of ITEM0001 (no DOI field, DOI only in its doi.org URL, site suffix in the
+// title), carrying its own note, PDF and highlight, a folder, an automatic tag, and a relation left
+// over from an earlier merge.
+Object.assign(state.items, {
+  ITEM0004: {
+    key: "ITEM0004", version: 5,
+    data: {
+      itemType: "webpage", title: "Conceptual Metaphor in Everyday Language | The Journal of Philosophy",
+      url: "https://doi.org/10.2307/2025464", creators: [], tags: [{ tag: "saved-page", type: 1 }],
+      collections: ["CCCC3333"], relations: { "dc:replaces": "http://zotero.org/users/1234/items/OLDCOPY1" },
+      dateAdded: "2025-06-01T10:00:00Z",
+    },
+  },
+  NOTE0002: { key: "NOTE0002", version: 5, data: { itemType: "note", parentItem: "ITEM0004", note: "<p>Reading notes on the web copy.</p>", dateModified: "2025-06-02T09:00:00Z" } },
+  ATT00002: { key: "ATT00002", version: 5, data: { itemType: "attachment", parentItem: "ITEM0004", contentType: "application/pdf", title: "web-copy.pdf", filename: "web-copy.pdf" } },
+  ANN00002: { key: "ANN00002", version: 5, data: { itemType: "annotation", parentItem: "ATT00002", annotationType: "highlight", annotationText: "highlight made on the web copy", annotationColor: "#ff6666", annotationPageLabel: "1" } },
+  // A preprint of the same paper: DOI only in Extra, title differing in case and punctuation.
+  ITEM0005: {
+    key: "ITEM0005", version: 5,
+    data: {
+      itemType: "preprint", title: "Conceptual metaphor in everyday language.", extra: "DOI: 10.2307/2025464",
+      creators: [{ creatorType: "author", firstName: "George", lastName: "Lakoff" }], date: "1979",
+      tags: [{ tag: "metaphor" }], collections: ["AAAA1111"], dateAdded: "2025-05-01T10:00:00Z",
+    },
+  },
+  // Two unrelated works with the same short title must never be grouped.
+  SHORT001: { key: "SHORT001", version: 1, data: { itemType: "journalArticle", title: "Introduction", tags: [], collections: [], dateAdded: "2025-01-01T00:00:00Z" } },
+  SHORT002: { key: "SHORT002", version: 1, data: { itemType: "bookSection", title: "Introduction", tags: [], collections: [], dateAdded: "2025-01-02T00:00:00Z" } },
+});
+const colsBeforeMerge = [...state.items.ITEM0001.data.collections];
+const tagsBeforeMerge = JSON.stringify(state.items.ITEM0001.data.tags);
+const titleBeforeMerge = state.items.ITEM0001.data.title;
+
+r = await call("find_duplicates", {});
+const scan = JSON.parse(r.text);
+const lakoffGroup = scan.groups.find((g) => g.copies.some((c) => c.key === "ITEM0001"));
+check("find_duplicates groups paper, saved page and preprint", !!lakoffGroup && ["ITEM0001", "ITEM0004", "ITEM0005"].every((k) => lakoffGroup.copies.some((c) => c.key === k)), r.text.slice(0, 1500));
+check("DOI found in url and Extra, not just the DOI field", lakoffGroup?.matched_on.includes("DOI"), JSON.stringify(lakoffGroup?.matched_on));
+check("suggests keeping the published copy", lakoffGroup?.suggested_keep === "ITEM0001", JSON.stringify(lakoffGroup?.suggested_keep));
+check("copies report notes and attachments", lakoffGroup?.copies.find((c) => c.key === "ITEM0004")?.attachments === 1, JSON.stringify(lakoffGroup?.copies));
+check("copies report folders by name", lakoffGroup?.copies.find((c) => c.key === "ITEM0004")?.folders.includes("Unsorted"), JSON.stringify(lakoffGroup?.copies));
+check("short identical titles are not grouped", !scan.groups.some((g) => g.copies.some((c) => c.key === "SHORT001")), r.text.slice(0, 800));
+check("same paper added twice earlier is found", scan.groups.some((g) => g.copies.some((c) => c.title === "Designing for Reflection in Collaborative Systems")), r.text.slice(0, 800));
+
+r = await call("find_duplicates", { collection: "Unsorted" });
+check("collection-scoped scan only looks inside it", !JSON.parse(r.text).groups.some((g) => g.copies.some((c) => c.key === "ITEM0001")), r.text.slice(0, 600));
+
+// Refusals.
+r = await call("merge_items", { keep: "ITEM0001", duplicates: ["ITEM0001"] });
+check("merge refuses keeping and trashing the same item", r.isError, r.text);
+r = await call("merge_items", { keep: "ATT00001", duplicates: ["ITEM0004"] });
+check("merge refuses an attachment as the kept copy", r.isError && r.text.includes("attachment"), r.text);
+
+// Dry run changes nothing.
+r = await call("merge_items", { keep: "ITEM0001", duplicates: ["ITEM0004", "ITEM0005"], dry_run: true });
+check("merge dry run lists what moves", r.text.includes('"dry_run": true') && r.text.includes("web-copy.pdf") && r.text.includes("Unsorted"), r.text.slice(0, 1200));
+check("merge dry run changes nothing", state.items.NOTE0002.data.parentItem === "ITEM0004" && state.items.ITEM0004.data.deleted !== 1);
+
+// The real merge.
+r = await call("merge_items", { keep: "ITEM0001", duplicates: ["ITEM0004", "ITEM0005"] });
+const mergeChange = r.text.match(/"change_id": "(chg_[^"]+)"/)?.[1];
+const m1 = state.items.ITEM0001.data;
+check("merge reports both merged", (r.text.match(/"merged": true/g) || []).length === 2 && !!mergeChange, r.text.slice(0, 1200));
+check("note moved to kept copy", state.items.NOTE0002.data.parentItem === "ITEM0001");
+check("PDF moved to kept copy", state.items.ATT00002.data.parentItem === "ITEM0001");
+check("highlight travels with its PDF", state.items.ANN00002.data.parentItem === "ATT00002");
+check("kept copy gains the duplicate's folder", m1.collections.includes("CCCC3333"), JSON.stringify(m1.collections));
+check("folders are not doubled", m1.collections.filter((c) => c === "AAAA1111").length === 1, JSON.stringify(m1.collections));
+check("tags copied with their type", m1.tags.some((t) => t.tag === "saved-page" && t.type === 1), JSON.stringify(m1.tags));
+const replaces = [].concat(m1.relations?.["dc:replaces"] || []);
+check("kept copy records what it replaces", replaces.includes("http://zotero.org/users/1234/items/ITEM0004") && replaces.includes("http://zotero.org/users/1234/items/ITEM0005"), JSON.stringify(m1.relations));
+check("earlier replacements carried over", replaces.includes("http://zotero.org/users/1234/items/OLDCOPY1"), JSON.stringify(m1.relations));
+check("duplicates trashed", state.items.ITEM0004.data.deleted === 1 && state.items.ITEM0005.data.deleted === 1);
+check("kept copy metadata untouched", m1.title === titleBeforeMerge && m1.DOI === "10.2307/2025464");
+r = await call("get_notes_and_annotations", { item: "ITEM0001" });
+check("kept copy shows notes and highlights from both", r.text.includes("Reading notes on the web copy") && r.text.includes("Key claim") && r.text.includes("highlight made on the web copy") && r.text.includes("central thesis"), r.text.slice(0, 1200));
+r = await call("find_duplicates", {});
+check("merged group no longer reported", !JSON.parse(r.text).groups.some((g) => g.copies.some((c) => c.key === "ITEM0001")), r.text.slice(0, 600));
+
+// One undo reverses the whole merge.
+r = await call("undo_changes", { change_ids: [mergeChange] });
+const u1 = state.items.ITEM0001.data;
+check("undo reports no errors", !r.text.includes('"errors": ["'), r.text.slice(0, 800));
+check("undo restores both duplicates", state.items.ITEM0004.data.deleted === 0 && state.items.ITEM0005.data.deleted === 0);
+check("undo moves note and PDF back", state.items.NOTE0002.data.parentItem === "ITEM0004" && state.items.ATT00002.data.parentItem === "ITEM0004");
+check("undo restores folders", JSON.stringify(u1.collections) === JSON.stringify(colsBeforeMerge), JSON.stringify(u1.collections));
+check("undo restores tags", JSON.stringify(u1.tags) === tagsBeforeMerge, JSON.stringify(u1.tags));
+check("undo removes the replaces links", !u1.relations?.["dc:replaces"], JSON.stringify(u1.relations));
+
+// A step that fails leaves that duplicate in the library rather than stranding its notes in the trash.
+Object.assign(state.items, {
+  ITEM0006: { key: "ITEM0006", version: 1, data: { itemType: "journalArticle", title: "Conceptual Metaphor in Everyday Language", tags: [], collections: ["BBBB2222"], dateAdded: "2025-07-01T00:00:00Z" } },
+  BADCHILD: { key: "BADCHILD", version: 1, data: { itemType: "note", parentItem: "ITEM0006", note: "<p>unmovable</p>" } },
+});
+r = await call("merge_items", { keep: "ITEM0001", duplicates: ["ITEM0006"] });
+check("failed step reported", r.text.includes('"merged": false') && r.text.includes("Simulated server error"), r.text.slice(0, 1000));
+check("duplicate with a failed step is not trashed", state.items.ITEM0006.data.deleted !== 1);
+check("its note stays with it", state.items.BADCHILD.data.parentItem === "ITEM0006");
+const partialChange = r.text.match(/"change_id": "(chg_[^"]+)"/)?.[1];
+check("steps that did succeed are journaled", !!partialChange && state.items.ITEM0001.data.collections.includes("BBBB2222"), r.text.slice(0, 600));
+r = await call("undo_changes", { change_ids: [partialChange] });
+check("partial merge undoes cleanly", !state.items.ITEM0001.data.collections.includes("BBBB2222") && !state.items.ITEM0001.data.relations?.["dc:replaces"], JSON.stringify(state.items.ITEM0001.data));
+
+// Undo refuses to drag a child away from a parent the user has since chosen.
+r = await call("merge_items", { keep: "ITEM0001", duplicates: ["ITEM0004"] });
+const laterChange = r.text.match(/"change_id": "(chg_[^"]+)"/)?.[1];
+state.items.NOTE0002.data.parentItem = "ITEM0002"; // the user re-filed the note by hand
+state.items.NOTE0002.version++;
+r = await call("undo_changes", { change_ids: [laterChange] });
+check("undo leaves a hand-moved note alone", state.items.NOTE0002.data.parentItem === "ITEM0002" && r.text.includes("no longer attached"), r.text.slice(0, 800));
+check("rest of that undo still applied", state.items.ITEM0004.data.deleted === 0 && state.items.ATT00002.data.parentItem === "ITEM0004");
 
 // ---- the timeout fix ----
 // A Zotero that accepts connections but never answers must produce an error, not a hang.
