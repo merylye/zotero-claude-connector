@@ -397,6 +397,28 @@ r = await call("undo_changes", { change_ids: [laterChange] });
 check("undo leaves a hand-moved note alone", state.items.NOTE0002.data.parentItem === "ITEM0002" && r.text.includes("no longer attached"), r.text.slice(0, 800));
 check("rest of that undo still applied", state.items.ITEM0004.data.deleted === 0 && state.items.ATT00002.data.parentItem === "ITEM0004");
 
+
+// ---- 1.3.1: scan fixes found on a real library ----
+Object.assign(state.items, {
+  // A supplement carrying its article's DOI is a separate document.
+  SUPPART1: { key: "SUPPART1", version: 1, data: { itemType: "journalArticle", title: "Reranking partisan animosity in algorithmic feeds", DOI: "10.1126/science.test01", date: "2025", creators: [{ creatorType: "author", lastName: "Piccardi" }], tags: [], collections: [], dateAdded: "2026-01-01T00:00:00Z" } },
+  SUPPLEM1: { key: "SUPPLEM1", version: 1, data: { itemType: "journalArticle", title: "Reranking partisan animosity in algorithmic feeds (Supplement)", DOI: "10.1126/science.test01", date: "2025", tags: [], collections: [], dateAdded: "2026-01-02T00:00:00Z" } },
+  // A yearless "journal article" stub must not beat a dated preprint.
+  STUBJA01: { key: "STUBJA01", version: 1, data: { itemType: "journalArticle", title: "Psychological Coupling: The Necessary Science of Human-AI Interaction", creators: [{ creatorType: "author", lastName: "Rocca" }], tags: [], collections: [], dateAdded: "2026-01-01T00:00:00Z" } },
+  PREPRNT1: { key: "PREPRNT1", version: 1, data: { itemType: "preprint", title: "Psychological Coupling: The Necessary Science of Human-AI Interaction", date: "2026", creators: [{ creatorType: "author", lastName: "Rocca" }], tags: [], collections: [], dateAdded: "2026-02-01T00:00:00Z" } },
+  // Three years apart is enough to ask.
+  BOUND209: { key: "BOUND209", version: 1, data: { itemType: "preprint", title: "Boundary Regulation in Social Media Sites", date: "2009", creators: [{ creatorType: "author", lastName: "Stutzman" }], tags: [], collections: [], dateAdded: "2024-01-01T00:00:00Z" } },
+  BOUND212: { key: "BOUND212", version: 1, data: { itemType: "journalArticle", title: "Boundary regulation in social media sites", date: "2012", creators: [{ creatorType: "author", lastName: "Stutzman" }], tags: [], collections: [], dateAdded: "2024-01-02T00:00:00Z" } },
+});
+r = await call("find_duplicates", {});
+const scan2 = JSON.parse(r.text);
+check("supplement sharing a DOI is not grouped with its article", !scan2.groups.some((g) => g.copies.some((c) => c.key === "SUPPLEM1")), r.text.slice(0, 600));
+const stubGroup = scan2.groups.find((g) => g.copies.some((c) => c.key === "STUBJA01"));
+check("dated preprint preferred over a yearless stub", stubGroup?.suggested_keep === "PREPRNT1", JSON.stringify(stubGroup));
+check("stub reason explains itself", /incomplete record/.test(stubGroup?.why || ""), JSON.stringify(stubGroup?.why));
+const boundGroup = scan2.groups.find((g) => g.copies.some((c) => c.key === "BOUND212"));
+check("three-year gap gets a caution", (boundGroup?.caution || []).some((c) => c.includes("Years differ by 3")), JSON.stringify(boundGroup));
+for (const k of ["SUPPART1", "SUPPLEM1", "STUBJA01", "PREPRNT1", "BOUND209", "BOUND212"]) delete state.items[k];
 // ---- the timeout fix ----
 // A Zotero that accepts connections but never answers must produce an error, not a hang.
 startBlackHole(8199);

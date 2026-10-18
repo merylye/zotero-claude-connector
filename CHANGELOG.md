@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.1 (2026-10-18)
+
+### Fixed
+Two problems surfaced the first time `find_duplicates` ran on a real library of about 1,500 items.
+- **Supplements were grouped with their article.** A supplement saved as its own item usually carries
+  the article's DOI, so a DOI match paired them. Items whose title marks them as a supplement,
+  supporting information, appendix, erratum, corrigendum or correction are now left out of DOI matching.
+- **Incomplete records were preferred.** A "journal article" with no year, typically left behind by a
+  failed PDF import, outranked a complete, dated preprint of the same paper because the ranking leaned
+  on item type alone. A record with no year, or with neither authors nor a DOI, now ranks below any
+  complete record. The suggested-keep reason says so when this decides it.
+- Copies three years apart now get the "check these really are the same work" caution, which
+  previously needed a gap of four.
+
 ## 1.3.0 (2026-10-18)
 
 ### Added

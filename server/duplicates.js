@@ -57,6 +57,20 @@ function titleIsDistinctive(norm) {
   return norm.length >= 25 && norm.split(" ").length >= 4;
 }
 
+// Supplements, appendices and corrections often carry the parent article's DOI, but they are
+// separate documents and must never be merged into it.
+const COMPANION_RE = /\b(supplement(ary)?|supporting information|appendix|appendices|erratum|errata|corrigendum|correction to)\b/i;
+export function isCompanion(data) {
+  return COMPANION_RE.test(String(data.title || ""));
+}
+
+// A record with no year, or with neither authors nor a DOI, is usually a stub left by a failed
+// import. Its item type says little about whether it is the version of record.
+export function isStub(data) {
+  const hasYear = /\d{4}/.test(data.date || "");
+  return !hasYear || (!(data.creators || []).length && !itemDOI(data));
+}
+
 function year(data) {
   return (data.date || "").match(/\d{4}/)?.[0] || "";
 }
@@ -82,7 +96,7 @@ export function groupDuplicates(items) {
   const byTitle = new Map();
   for (const it of items) {
     const d = it.data || {};
-    const doi = itemDOI(d);
+    const doi = isCompanion(d) ? null : itemDOI(d);
     if (doi) {
       if (byDOI.has(doi)) union(it.key, byDOI.get(doi));
       else byDOI.set(doi, it.key);
@@ -125,7 +139,7 @@ export function groupDuplicates(items) {
     }
     if (years.length > 1) {
       const span = Math.max(...years.map(Number)) - Math.min(...years.map(Number));
-      if (span > 3) caution.push(`Years differ by ${span}; check these really are the same work before merging.`);
+      if (span >= 3) caution.push(`Years differ by ${span}; check these really are the same work before merging.`);
     }
     out.push({ members, matchedOn, caution });
   }
@@ -139,7 +153,8 @@ export function rankForKeeping(members, childCounts = {}) {
   const score = (m) => {
     const d = m.data || {};
     let s = 0;
-    if (PUBLISHED_TYPES.has(d.itemType)) s += 1000;
+    if (isStub(d)) s += WEAK_TYPES.has(d.itemType) ? 0 : 200;
+    else if (PUBLISHED_TYPES.has(d.itemType)) s += 1000;
     else if (d.itemType === "preprint") s += 500;
     else if (WEAK_TYPES.has(d.itemType)) s += 0;
     else s += 300;
@@ -158,6 +173,9 @@ export function rankForKeeping(members, childCounts = {}) {
 
 export function keepReason(best, others) {
   const t = best.data.itemType;
+  if (!isStub(best.data) && others.some((o) => isStub(o.data) && !WEAK_TYPES.has(o.data.itemType))) {
+    return "the other copy looks like an incomplete record (no year, or no authors and no DOI)";
+  }
   if (PUBLISHED_TYPES.has(t) && others.some((o) => !PUBLISHED_TYPES.has(o.data.itemType))) {
     return `the published ${t} rather than a preprint or saved page`;
   }

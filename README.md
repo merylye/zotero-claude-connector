@@ -54,7 +54,7 @@ History:
 
 ## Install
 
-1. Download `dist/zotero-connector-1.3.0.mcpb` from this repo.
+1. Download `dist/zotero-connector-1.3.1.mcpb` from this repo.
 2. In Zotero, open **Settings → Advanced** and check
    **"Allow other applications on this computer to communicate with Zotero"**.
 3. Double-click the `.mcpb`, or drag it onto the Claude Desktop window, and click Install.
@@ -100,7 +100,7 @@ or by title; collections by name, by a `Parent/Child` path, or by key.
 | `read_paper` | `item`, `offset`, `max_chars` | Full text in chunks, with metadata and the PDF's path on disk. Defaults to 80,000 characters and reports how much remains |
 | `get_notes_and_annotations` | `item` | Your notes with HTML stripped, and highlights from Zotero's reader with page, colour, and comment |
 | `export_bibliography` | `collection` or `items[]`, `format`, `style` | `format: "bibtex"` for a .bib, `format: "styled"` for prose in any CSL style (`apa`, `chicago-note-bibliography`, and so on) |
-| `find_duplicates` | `collection`, `max_groups` | Groups of probable duplicates, matched on a shared DOI (from the DOI field, a `DOI:` line in Extra, or a doi.org URL) or on a title that matches once case, punctuation and a publisher-site suffix are ignored. Titles under four words are never matched. Each group lists every copy with its type, folders, and note and attachment counts, and suggests which to keep |
+| `find_duplicates` | `collection`, `max_groups` | Groups of probable duplicates, matched on a shared DOI (from the DOI field, a `DOI:` line in Extra, or a doi.org URL) or on a title that matches once case, punctuation and a publisher-site suffix are ignored. Titles under four words are never matched, and a supplement, appendix or correction is never grouped with its article by DOI. Each group lists every copy with its type, folders, and note and attachment counts, and suggests which to keep. A record with no year, or with neither authors nor a DOI, is treated as an incomplete stub and is not preferred just because it is labelled a journal article |
 
 ### Adding items (web API, needs a key)
 

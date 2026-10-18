@@ -53,7 +53,7 @@ const ENABLE_WRITES = (process.env.ENABLE_WRITES || "true").toLowerCase() !== "f
 const ENABLE_DELETES =
   ENABLE_WRITES && (process.env.ENABLE_DELETES || "true").toLowerCase() !== "false";
 
-const server = new McpServer({ name: "zotero-connector", version: "1.3.0" });
+const server = new McpServer({ name: "zotero-connector", version: "1.3.1" });
 
 const LIB_PARAM = z
   .string()
